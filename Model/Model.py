@@ -317,17 +317,71 @@ class PINN(nn.Module):
         self.logger.removeHandler(self.logger.handlers[0])
         self.logger.handlers.clear()
 
+    # Loads model from saved location 
     def load_model(self, model_path):
+        """
+        Load the model weights from a saved checkpoint file.
+
+        This method restores the saved state dictionaries for the submodules
+        `solution_u` and `dynamical_F` from the given checkpoint file. It also
+        ensures that all parameters in `solution_u` are set to be trainable,
+        allowing further training or fine-tuning.
+
+        Args:
+            model_path (str): Path to the saved checkpoint file containing
+                            model state dictionaries.
+        """
+        # Loads checkpoint dadta from model_path
         checkpoint = torch.load(model_path)
+        # Gives solution_u and dynamical_F their saved weights
         self.solution_u.load_state_dict(checkpoint['solution_u'])
         self.dynamical_F.load_state_dict(checkpoint['dynamical_F'])
+        # Ensures every solution_u parameter is trainable
         for param in self.solution_u.parameters():
             param.requires_grad = True
 
+    
     def predict(self,xt):
+        """
+        Generate predictions from the model for the given input features.
+
+        Args:
+            xt (torch.Tensor): Input tensor of shape (batch_size, input_dim), containing
+                            the features for which predictions are needed.
+
+        Returns:
+            torch.Tensor: Predicted output tensor of shape (batch_size, 1), representing
+                        the model’s predicted SOH (state of health) values.
+        
+        Description:
+            This method feeds the input features through the `solution_u` network,
+            which internally consists of an encoder (MLP) and a predictor head.
+            It is primarily used for evaluation or inference, without computing gradients.
+        """
         return self.solution_u(xt)
 
+    
     def Test(self,testloader):
+        """
+        Evaluate the model on a test dataset and collect predictions and true labels.
+
+        Args:
+            testloader (torch.utils.data.DataLoader): DataLoader providing batches of test data.
+                Each batch should return a tuple containing input features and labels.
+
+        Returns:
+            tuple:
+                - true_label (np.ndarray): Concatenated ground-truth labels for the entire test set.
+                - pred_label (np.ndarray): Concatenated predicted values for the entire test set.
+        
+        Description:
+            This method:
+            1. Puts the model in evaluation mode (disables dropout, batchnorm updates, etc.).
+            2. Iterates over the test data without computing gradients.
+            3. Passes each batch through the model using `predict()`.
+            4. Collects true labels and predictions, converts them to NumPy arrays, and concatenates them.
+            5. Returns the full arrays for later evaluation (e.g., computing MSE, MAE, or plotting).
+        """
         self.eval()
         true_label = []
         pred_label = []
@@ -343,6 +397,28 @@ class PINN(nn.Module):
         return true_label,pred_label
 
     def Valid(self,validloader):
+        """
+        Evaluate the model on a validation dataset and compute the mean squared error (MSE).
+
+        Args:
+            validloader (torch.utils.data.DataLoader): DataLoader providing batches of validation data.
+                Each batch should return a tuple containing input features and labels.
+                The format is expected to be (x1, _, y1, _), where only x1 and y1 are used.
+
+        Returns:
+            float: Mean Squared Error (MSE) between the model’s predictions and true labels
+                across the entire validation set.
+
+        Description:
+            This method:
+            1. Puts the model in evaluation mode to disable dropout and batch normalization updates.
+            2. Iterates over the validation data without computing gradients (torch.no_grad()).
+            3. Uses the `predict()` method to generate model outputs for each batch.
+            4. Collects and concatenates predictions and true labels across all batches.
+            5. Computes the mean squared error between predictions and true labels.
+            6. Returns a single scalar MSE value that can be used to monitor validation performance
+            during training or for early stopping decisions.
+        """
         self.eval()
         true_label = []
         pred_label = []
@@ -358,55 +434,132 @@ class PINN(nn.Module):
         return mse.item()
 
     def forward(self,xt):
+        """
+        Forward pass for the PINN, computing both the predicted output and the PDE residual.
+
+        This method performs the following steps:
+        1. Splits the input tensor `xt` into features `x` and time `t`.
+        2. Passes `[x, t]` through the `solution_u` network to predict `u` (state of health, SOH).
+        3. Computes the derivatives of `u` w.r.t. `t` (`u_t`) and `x` (`u_x`) for physics constraints.
+        4. Passes `[xt, u, u_x, u_t]` through the `dynamical_F` network to obtain the PDE term `F`.
+        5. Computes the PDE residual `f = u_t - F`, which quantifies how much the prediction violates the PDE.
+
+        Args:
+            xt (torch.Tensor): Input tensor of shape (batch_size, n_features+1),
+                            where the last column represents time `t`.
+
+        Returns:
+            tuple:
+                u (torch.Tensor): Predicted state variable (SOH) of shape (batch_size, 1).
+                f (torch.Tensor): PDE residual tensor of shape (batch_size, 1),
+                                used for physics-informed loss calculation.
+        """
+        # Enables gradients for input
         xt.requires_grad = True
+        # Sets x to all features except the last column
         x = xt[:,0:-1]
+        # Sets t to be the last column (time feature)
         t = xt[:,-1:]
 
+        # Concatenates x and t and passes through solution_u to get predicted SOH
         u = self.solution_u(torch.cat((x,t),dim=1))
 
+        # Computes gradients of u w.r.t. t and x
+        # u_t: time derivative of u
         u_t = grad(u.sum(),t,
                    create_graph=True,
                    only_inputs=True,
                    allow_unused=True)[0]
+        # u_x: spatial derivative of u
         u_x = grad(u.sum(),x,
                    create_graph=True,
                    only_inputs=True,
                    allow_unused=True)[0]
 
+        # Computes the PDE term F using dynamical_F network
         F = self.dynamical_F(torch.cat([xt,u,u_x,u_t],dim=1))
 
+        # f is the residual of the PDE, i.e., how much the network violates the physia law
         f = u_t - F
         return u,f
 
     def train_one_epoch(self,epoch,dataloader):
+        """
+        Train the PINN model for one full epoch over the provided data.
+
+        This method performs the following steps for each batch in the dataloader:
+            1. Moves the input and target tensors to the correct device (CPU/GPU).
+            2. Computes the model predictions and PDE residuals using `self.forward()`.
+            3. Computes three components of the loss:
+                - loss1: data loss (mean squared error between predicted and true SOH)
+                - loss2: PDE loss (mean squared error of the residual f = u_t - F)
+                - loss3: physics loss (enforces u2 - u1 < 0 constraint)
+            4. Combines the losses using the weights `self.alpha` and `self.beta`.
+            5. Performs backpropagation using `loss.backward()`.
+            6. Updates the parameters of `solution_u` and `dynamical_F` using their respective optimizers.
+            7. Updates the running average of each loss using `AverageMeter` for monitoring.
+
+        Args:
+            epoch (int): The current epoch number (used for logging).
+            dataloader (torch.utils.data.DataLoader): DataLoader providing batches of
+                (x1, x2, y1, y2) tuples for training.
+
+        Returns:
+            tuple: A tuple of three floats:
+                - avg_data_loss: average data loss (loss1) over the epoch
+                - avg_pde_loss: average PDE loss (loss2) over the epoch
+                - avg_phys_loss: average physics loss (loss3) over the epoch
+
+        Notes:
+            - The model is set to training mode with `self.train()` to enable dropout.
+            - Gradients are zeroed before each backward pass to avoid accumulation.
+            - Logging occurs every 50 iterations to monitor progress.
+        """
+        # Puts model in training mode (to enable dropout, batchnorm updates, etc.)
         self.train()
+        # Tracks running averages of each loss component
         loss1_meter = AverageMeter()
         loss2_meter = AverageMeter()
         loss3_meter = AverageMeter()
+
+        # Iterates over batches from the dataloader
         for iter,(x1,x2,y1,y2) in enumerate(dataloader):
+            # Moves them to correct device
             x1,x2,y1,y2 = x1.to(device),x2.to(device),y1.to(device),y2.to(device)
+
+            # Forward pass for both time steps calculating predicted SOH and PDE residual
             u1,f1 = self.forward(x1)
             u2,f2 = self.forward(x2)
 
             # data loss
+            # MSE equally weighing x1 and x2
             loss1 = 0.5*self.loss_func(u1,y1) + 0.5*self.loss_func(u2,y2)
 
             # PDE loss
+            # The loss is MSE of residuals vs 0
             f_target = torch.zeros_like(f1)
             loss2 = 0.5*self.loss_func(f1,f_target) + 0.5*self.loss_func(f2,f_target)
 
             # physics loss  u2-u1<0, considering capacity regeneration
+            # enforces physical rules via ReLU, meaning penalizes if u2 - u1 >0
             loss3 = self.relu(torch.mul(u2-u1,y1-y2)).sum()
 
             # total loss
+            # Alpha and beta are the wieghts for PDE and physics losses
             loss = loss1 + self.alpha*loss2 + self.beta*loss3
 
+            # Backpropagation and optimization step
+            # Resets gradients to 0s
             self.optimizer1.zero_grad()
             self.optimizer2.zero_grad()
+            # Computes gradients stepping backwards thorugh nodes
             loss.backward()
+            # Optimizers use the computed gradients to update model weights
+            # Updates all the weights at once using the lr
             self.optimizer1.step()
             self.optimizer2.step()
 
+            # Adds new losses to the loss meters
             loss1_meter.update(loss1.item())
             loss2_meter.update(loss2.item())
             loss3_meter.update(loss3.item())
@@ -414,26 +567,72 @@ class PINN(nn.Module):
             #              "PDE loss:{:.6f}, physics loss:{:.6f}, " \
             #              "total loss:{:.6f}".format(epoch,iter+1,loss1,loss2,loss3,loss.item())
 
+            # Adds logs to batch every 50 iterations
             if (iter+1) % 50 == 0:
                 print("[epoch:{} iter:{}] data loss:{:.6f}, PDE loss:{:.6f}, physics loss:{:.6f}".format(epoch,iter+1,loss1,loss2,loss3))
+
+        # Returns the average losses for the epoch
         return loss1_meter.avg,loss2_meter.avg,loss3_meter.avg
 
     def Train(self,trainloader,testloader=None,validloader=None):
+        """
+        Train the PINN model over multiple epochs, optionally performing validation and testing,
+        and saving the best model based on validation performance.
+
+        This method performs the following steps:
+            1. Iterates over the specified number of epochs (`self.args.epochs`).
+            2. Calls `train_one_epoch` to train on all batches of the `trainloader` and computes
+            average data, PDE, and physics losses for the epoch.
+            3. Updates the learning rate using the scheduler (`self.scheduler.step()`).
+            4. Logs training information (epoch, learning rate, and weighted total loss).
+            5. If a validation loader is provided, computes validation MSE using `Valid()` and logs it.
+            6. If the current validation MSE is lower than the best seen so far:
+                - Runs testing using `Test()` if a `testloader` is provided.
+                - Computes evaluation metrics (MAE, MAPE, MSE, RMSE) on test data.
+                - Logs the metrics.
+                - Saves the model weights (`solution_u` and `dynamical_F`) as the best model.
+                - Optionally saves the true and predicted labels to disk.
+            7. Implements early stopping based on validation performance if `self.args.early_stop` is set.
+            8. Clears the logger at the end of training to prevent duplicate logs in future runs.
+            9. Saves the best model checkpoint to the specified folder if `self.args.save_folder` is provided.
+
+        Args:
+            trainloader (torch.utils.data.DataLoader): DataLoader providing training batches.
+            testloader (torch.utils.data.DataLoader, optional): DataLoader for testing. Default is None.
+            validloader (torch.utils.data.DataLoader, optional): DataLoader for validation. Default is None.
+
+        Returns:
+            None. 
+            - Training, validation, and test metrics are logged via `self.logger`.
+            - The best model is stored in `self.best_model` and optionally saved to disk.
+
+        Notes:
+            - Uses multiple loss components (data, PDE, physics) weighted by self.alpha and self.beta.
+            - Early stopping prevents overfitting by stopping training if validation loss does not improve.
+            - Learning rate scheduling is handled automatically for `solution_u` via `self.scheduler`.
+        """
         min_valid_mse = 10
         valid_mse = 10
         early_stop = 0
         mae = 10
+        # Iterates through epochs
         for e in range(1,self.args.epochs+1):
             early_stop += 1
+            # Gets curernt losses
             loss1,loss2,loss3 = self.train_one_epoch(e,trainloader)
+            # Updates learning rate
             current_lr = self.scheduler.step()
+            # Logs training info: epoch, lr, total loss
             info = '[Train] epoch:{}, lr:{:.6f}, ' \
                    'total loss:{:.6f}'.format(e,current_lr,loss1+self.alpha*loss2+self.beta*loss3)
             self.logger.info(info)
+            # Validates every epoch if validloader is provided
             if e % 1 == 0 and validloader is not None:
                 valid_mse = self.Valid(validloader)
                 info = '[Valid] epoch:{}, MSE: {}'.format(e,valid_mse)
                 self.logger.info(info)
+            # Runs if current validation MSE is better than the best so far
+            # Runs test set evaluation and saves the best model
             if valid_mse < min_valid_mse and testloader is not None:
                 min_valid_mse = valid_mse
                 true_label,pred_label = self.Test(testloader)
@@ -449,11 +648,15 @@ class PINN(nn.Module):
                     np.save(os.path.join(self.args.save_folder, 'true_label.npy'), true_label)
                     np.save(os.path.join(self.args.save_folder, 'pred_label.npy'), pred_label)
                 ##################################################################################
+            # Early stopping check
+            # Stops training if MSE has not improved for early_stop number of epochs
             if self.args.early_stop is not None and early_stop > self.args.early_stop:
                 info = 'early stop at epoch {}'.format(e)
                 self.logger.info(info)
                 break
+        # Clears logger to avoid duplicates in future runs
         self.clear_logger()
+        # Saves the best model to disk if a save folder is specified
         if self.args.save_folder is not None:
             torch.save(self.best_model,os.path.join(self.args.save_folder,'model.pth'))
 
